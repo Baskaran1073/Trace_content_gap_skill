@@ -7,7 +7,9 @@
     "mcp": "https://your-domain.ngrok-free.app/mcp"
   },
   "triggers": [
-    { "channel": "interaction.dialog", "routing_mode": "active" }
+    { "channel": "instant.message", "routing_mode": "active" },
+    { "channel": "instant.image",      "routing_mode": "active" },
+    { "channel": "media.photo",        "routing_mode": "passive" }
   ],
   "domains": {
     "general": "Handle general greetings and tests for the template skill. Match utterances like 'test template' or 'hello from template'."

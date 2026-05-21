@@ -36,7 +36,7 @@ Your skill is defined by the `manifest.json`. You must submit this manifest via 
 ### Key Fields:
 - **`name`**: Human-readable name of your skill.
 - **`interface`**: `hybrid` allows both Webhooks and MCP.
-- **`triggers`**: Defines what events your skill "listens" to. By default, it listens to `interaction.dialog` (voice).
+- **`triggers`**: Defines what events your skill "listens" to. By default, it listens to `instant.message` (voice).
 - **`permissions`**: List of permissions your skill needs. Common ones:
     - `notification.send`: (Implicit) Ability to sent toasts/TTS.
     - `user.profile.read`: Ability to see the user's name.
@@ -59,7 +59,7 @@ Your skill is defined by the `manifest.json`. You must submit this manifest via 
         "mcp": "https://your-domain.localhost.run/mcp"
       },
       "triggers": [
-        { "channel": "interaction.dialog", "routing_mode": "active" }
+        { "channel": "instant.message", "routing_mode": "active" }
       ],
       "domains": {
         "general": "Handle general greetings and tests for the template skill. Match utterances like 'test template' or 'hello from template'."

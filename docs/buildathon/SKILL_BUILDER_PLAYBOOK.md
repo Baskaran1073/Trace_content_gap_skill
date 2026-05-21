@@ -60,7 +60,7 @@ ngrok http 3000
 2. Click **Create New Skill**.
 3. Set **Interface** to `Hybrid`.
 4. Paste your ngrok URL into the **Webhook** and **MCP** endpoints.
-5. Add a trigger for `interaction.dialog`.
+5. Add a trigger for `instant.message`.
 6. **Save**. Copy the **HMAC Secret** into your `.env`.
 
 ---
@@ -74,7 +74,7 @@ Best for processing photos or audio in the background.
 
 ### 🔵 MCP (Dialog-Native)
 Best for building voice assistants and interactive tools.
-- **Trigger**: `interaction.dialog`.
+- **Trigger**: `instant.message`.
 - **Flow**: User speaks → Platform calls your `handle_dialog` tool → Skill responds with text or actions.
 
 ### 🟣 Hybrid (The Pro Choice)

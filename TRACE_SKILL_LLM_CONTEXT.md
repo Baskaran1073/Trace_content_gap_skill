@@ -12,13 +12,38 @@ Trace Skills communicate via two interfaces. Most production skills are **Hybrid
 
 | Interface | Use case | Execution model |
 |---|---|---|
-| **Webhook** | Background media processing (photos, audio) | Async: return `202`, process, POST callback |
-| **MCP** | Interactive dialog — voice, text, phone image | Sync: return result in the JSON-RPC response |
+| **Webhook** | Passive background media processing (photos, audio, video) | Async: return `202`, process, POST callback |
+| **MCP** | Interactive dialog + active media events | Sync: return result in the JSON-RPC response |
+| **Hybrid** | Both — selects path per trigger | Active media → MCP; passive media → webhook; `instant.message` → MCP |
 
 ### Skill Interface Types
-- `webhook` — only processes media events
-- `mcp` — only handles dialog
-- `hybrid` — both; active `interaction.dialog` events go to MCP, `media.*` events go to webhook
+- `webhook` — only processes media events (always passive; no spoken response)
+- `mcp` — handles dialog **and** active media channels (synchronous, can respond with voice + AWAIT_INPUT)
+- `hybrid` — both; `routing_mode: active` media triggers with an MCP endpoint → MCP call; `routing_mode: passive` → webhook; `instant.message` active → MCP
+
+### Channel semantics: `media.photo` vs `instant.image`
+
+| Channel | When it fires | User context | Use for |
+|---|---|---|---|
+| `media.photo` | Glasses WiFi sync — photo arrives after the session | User is NOT actively talking | Silent background logging, enrichment, categorization |
+| `instant.image` | Real-time AI photo during active conversation ("what's this?", phone image chat) | User IS actively asking | Spoken response, AWAIT_INPUT follow-up, real-time analysis |
+
+Always subscribe to `instant.image` (not `media.photo`) when you want to respond with voice or ask the user a follow-up question. The two channels are intentionally separate so skills can opt into one, both, or neither.
+
+### Active vs Passive dispatch
+
+`routing_mode` on any channel controls the dispatch path:
+
+| routing_mode | Interface | Path | Skill can speak? | AWAIT_INPUT? |
+|---|---|---|---|---|
+| `passive` | webhook/hybrid | Webhook async job | No | Via callback (arrives later) |
+| `active` | webhook only | Webhook async job (active priority) | No | Via callback |
+| `active` | mcp/hybrid | **MCP synchronous call** | **Yes** | **Yes — immediately** |
+
+**Use `instant.image` + `active` + MCP/hybrid when your skill needs to:**
+- Speak a response after processing a real-time photo ("Logged! Anything to add?")
+- Ask a follow-up question via AWAIT_INPUT right after image capture
+- Return a real-time analysis to an active AI conversation
 
 ### File Structure
 ```
@@ -31,6 +56,108 @@ my-skill/
 ├── .env                # HMAC_SECRET, API keys
 └── package.json
 ```
+
+---
+
+## 1a. manifest.json — Full Specification
+
+The manifest is the single source of truth for how Trace routes events to your skill. Generate it first; all implementation decisions flow from it.
+
+**Developers can upload `manifest.json` directly to the Trace Developer Console** (`/dashboard/skills/create → Import manifest.json`). The dashboard parses it and pre-fills the registration form — no manual entry needed.
+
+### Complete manifest.json
+
+```json
+{
+  "name": "My Skill",
+  "description": "One sentence describing what this skill does for the user.",
+  "version": "1.0.0",
+  "interface": "hybrid",
+
+  "endpoints": {
+    "webhook": "https://your-server.com/webhook",
+    "mcp":     "https://your-server.com/mcp"
+  },
+
+  "triggers": [
+    { "channel": "instant.image",      "routing_mode": "active"  },
+    { "channel": "media.photo",        "routing_mode": "passive" },
+    { "channel": "instant.message", "routing_mode": "active"  }
+  ],
+  // instant.image — real-time photo taken during an active AI conversation (glasses "what's this?",
+  //   phone image sent to chat). Active + mcp/hybrid → MCP synchronous call, skill can speak + AWAIT_INPUT.
+  // media.photo  — WiFi-synced background photo. Use passive for silent logging; active-MCP also
+  //   supported if you want a spoken response for background sync events.
+  // instant.message — all voice/text turns (including AWAIT_INPUT follow-ups).
+
+  "domains": {
+    "event_journal": "Handle voice commands to start/end event journals, add notes, and set reminders during life events like weddings, trips, and concerts."
+  },
+
+  "execution": {
+    "mode": "async"
+  },
+
+  "permissions": [
+    "user.profile.read",
+    "user.location.read"
+  ],
+
+  "allowedTools": ["mail.send"],
+
+  "dataRetention": {
+    "max_days": 90,
+    "deletion_webhook": "https://your-server.com/delete-user"
+  },
+
+  "categories": ["lifestyle", "memory"],
+
+  "isPrivate": false,
+
+  "proactive": false
+}
+```
+
+### Field reference
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | string | Yes | 1–80 chars. Shown in Skill Store. |
+| `description` | string | No | Max 500 chars. |
+| `version` | string | Yes | Semver: `1.0.0` |
+| `interface` | `webhook` \| `mcp` \| `hybrid` | Yes | See §1 |
+| `endpoints.webhook` | URI | If `webhook` or `hybrid` | Your `/webhook` URL |
+| `endpoints.mcp` | URI | If `mcp` or `hybrid` | Your `/mcp` URL |
+| `endpoints.callback` | URI | No | Alternate callback target (rarely needed) |
+| `triggers` | array | No | Which channels wake your skill |
+| `triggers[].channel` | string | Yes | `instant.image`, `media.photo`, `media.video`, `media.audio`, `instant.message`, `device.context` |
+| `triggers[].routing_mode` | `active` \| `passive` | No | Default `active`. Use `passive` for silent background processing. |
+| `triggers[].filter` | object | No | `{"hasImage": true}`, `{"source": "phone_image"}`, etc. |
+| `domains` | object | No | Keys are domain names, values describe what utterances/images to route. Required when using `instant.message` or media triggers. |
+| `execution.mode` | `sync` \| `async` | Yes | Always `async` for `media.*` channels. |
+| `permissions` | array | No | Only `user.profile.read` and `user.location.read` are accepted. Channel-implied permissions are added automatically — do not repeat them here. |
+| `allowedTools` | array | No | `mail.send`, `calendar.create` |
+| `dataRetention.max_days` | number | Yes | 1–730 |
+| `dataRetention.deletion_webhook` | URI | Yes | Called when user uninstalls your skill. |
+| `categories` | array | No | Store browsing tags, e.g. `productivity`, `health`, `memory` |
+| `isPrivate` | boolean | No | If true, skill is never listed publicly even after approval. |
+| `proactive` | boolean | No | Set `true` only if your skill uses `/api/skill-push` proactively (requires review justification). |
+| `proactiveReason` | string | If `proactive: true` | Min 20 chars. Explain what you push, when, and why it can't be user-triggered. |
+
+### Rules for LLMs generating manifests
+
+1. **`interface`** — set `webhook` if only processing media passively, `mcp` if only dialog or active media, `hybrid` if both.
+2. **`execution.mode`** — always `async` if any `media.*` trigger is present (even active ones — the field refers to webhook async pattern, not MCP).
+3. **`triggers`** — decide `routing_mode` by response need:
+   - `passive` → silent background processing, no spoken response, webhook dispatch
+   - `active` + `webhook` interface → active webhook (still async, no voice response)
+   - `active` + `mcp`/`hybrid` interface → **MCP synchronous call**, skill can speak + issue AWAIT_INPUT
+4. **Use `instant.image` for real-time AI photos, `media.photo` for WiFi-sync background photos.** They are separate channels: `instant.image` fires during an active AI conversation (glasses "what's this?", phone image chat); `media.photo` fires when glasses sync photos over WiFi after the session.
+5. **`domains`** — required for `instant.message` (active routing) and for media channels where content-based routing matters. Describe both dialog utterances AND media content types your skill handles in one description.
+6. **`permissions`** — omit `notification.send` and channel-implied permissions (e.g. `media.photo.read`); the platform derives these automatically.
+7. **`allowedTools`** — only include tools your skill actually calls via `tool_call` responses.
+8. **`deletion_webhook`** — must point to a real endpoint that deletes all user data when called.
+9. **Active media MCP (`instant.image`)** — your `handle_dialog` tool receives `items[]` with the image URL and `context.source = "instant_image"`. `utterance` is empty for glasses captures, non-empty if the user spoke alongside the photo. Check `items` length before using image data.
 
 ---
 
@@ -63,21 +190,24 @@ Use `express.raw({ type: 'application/json' })` before JSON parsing so `rawBody`
 
 ### Channels
 
-| Channel | Source | Semantics |
-|---|---|---|
-| `media.photo` | Glasses | Photo captured and synced |
-| `media.video` | Glasses, Phone | Video captured and synced |
-| `media.audio` | Glasses | Audio recording captured and synced |
-| `interaction.dialog` | Glasses, Phone | Real-time user interaction — voice, text, or image+query |
+| Channel | Source | When | Semantics |
+|---|---|---|---|
+| `media.photo` | Glasses | WiFi sync after session | Background photo arrived; user NOT in conversation |
+| `media.video` | Glasses, Phone | WiFi sync | Background video arrived |
+| `media.audio` | Glasses | WiFi sync | Background audio recording arrived |
+| `instant.image` | Glasses, Phone | During active AI conversation | Real-time photo taken while user is talking ("what's this?") or phone image sent to chat |
+| `instant.message` | Glasses, Phone | Real-time | Voice, text, or image+query from user |
 
-**Phone mode rule:** All phone inputs (image, voice, text) go to `interaction.dialog`. Phone video is the only exception — it goes to `media.video`.
+**`instant.image` vs `media.photo`:** Use `instant.image` when you want to respond immediately with voice and optionally ask a follow-up. Use `media.photo` (passive) for silent background processing of WiFi-synced photos.
+
+**Phone mode rule:** All phone inputs (image, voice, text) go to `instant.message` OR `instant.image` (phone images via AI chat). Phone video is the only exception — it goes to `media.video`.
 
 ### Trigger Configuration (in Developer Console)
 ```json
 {
   "triggers": [
     { "channel": "media.photo", "routing_mode": "passive" },
-    { "channel": "interaction.dialog", "routing_mode": "active" }
+    { "channel": "instant.message", "routing_mode": "active" }
   ]
 }
 ```
@@ -86,17 +216,17 @@ Use `express.raw({ type: 'application/json' })` before JSON parsing so `rawBody`
 - `active` — platform selects your skill to handle this event; response is surfaced to the user
 - `passive` — background fire-and-forget; response goes to activity feed only
 
-### Trigger Filters for `interaction.dialog`
+### Trigger Filters for `instant.message`
 
 You can narrow when your skill fires:
 
 ```json
-{ "channel": "interaction.dialog", "filter": { "hasImage": true } }
-{ "channel": "interaction.dialog", "filter": { "hasQuery": true } }
-{ "channel": "interaction.dialog", "filter": { "source": "phone_image" } }
-{ "channel": "interaction.dialog", "filter": { "source": ["phone_image", "phone_image_text", "phone_voice_image"] } }
+{ "channel": "instant.message", "filter": { "hasImage": true } }
+{ "channel": "instant.message", "filter": { "hasQuery": true } }
+{ "channel": "instant.message", "filter": { "source": "phone_image" } }
+{ "channel": "instant.message", "filter": { "source": ["phone_image", "phone_image_text", "phone_voice_image"] } }
 // Match any image input including back-references (source: "ai_agent"):
-{ "channel": "interaction.dialog", "filter": { "hasImage": true } }
+{ "channel": "instant.message", "filter": { "hasImage": true } }
 ```
 
 Supported filter keys:
@@ -106,15 +236,15 @@ Supported filter keys:
 
 ---
 
-## 4. interaction.dialog Payload
+## 4. instant.message Payload
 
-Every `interaction.dialog` event has a normalized payload. The platform pre-processes images (vision description) before dispatching.
+Every `instant.message` event has a normalized payload. The platform pre-processes images (vision description) before dispatching.
 
-**Webhook/MCP `event` object fields for `interaction.dialog`:**
+**Webhook/MCP `event` object fields for `instant.message`:**
 
 ```json
 {
-  "channel": "interaction.dialog",
+  "channel": "instant.message",
   "source": "phone_voice_image",
   "query": "what's the calorie count?",
   "items": [
@@ -140,7 +270,7 @@ Every `interaction.dialog` event has a normalized payload. The platform pre-proc
 | `phone_voice_image` | Voice + photo simultaneously from phone | ✓ | ✓ image |
 | `ai_agent` | Back-reference: user refers to a previously captured image ("save that", "add that receipt") | ✓ | ✓ image† |
 
-**† Multi-turn back-reference (`ai_agent`):** When a user captures an image earlier in a session and later refers to it by pronoun or context ("save that", "log that image"), the platform resolves the prior image from session memory (up to 5 recent captures, 12-hour window) and dispatches on `interaction.dialog` with `source: "ai_agent"`. The `items[0]` contains the original image URL and its pre-analysis description. Your skill **must** have an `interaction.dialog` trigger to receive back-reference events — `media.photo` alone is not sufficient. Use `{ "hasImage": true }` as a filter to match both direct image inputs and back-references.
+**† Multi-turn back-reference (`ai_agent`):** When a user captures an image earlier in a session and later refers to it by pronoun or context ("save that", "log that image"), the platform resolves the prior image from session memory (up to 5 recent captures, 12-hour window) and dispatches on `instant.message` with `source: "ai_agent"`. The `items[0]` contains the original image URL and its pre-analysis description. Your skill **must** have an `instant.message` trigger to receive back-reference events — `media.photo` alone is not sufficient. Use `{ "hasImage": true }` as a filter to match both direct image inputs and back-references.
 
 **Key fields:**
 - `event.query` — the user's text or voice transcript (empty string if image-only)
@@ -230,9 +360,9 @@ POST to `callback_url` with HMAC-signed body:
 
 Sign the callback just like incoming requests: `sha256=hmac(secret, timestamp + "." + body)`.
 
-### Sync Response (200) for `interaction.dialog`
+### Sync Response (200) for `instant.message`
 
-For `interaction.dialog` events dispatched to a webhook (pending-context follow-ups for WEBHOOK-only skills), return 200 with the same `responses` array shape — no `request_id` or `status` wrapper needed, just the `responses` key.
+For `instant.message` events dispatched to a webhook (pending-context follow-ups for WEBHOOK-only skills), return 200 with the same `responses` array shape — no `request_id` or `status` wrapper needed, just the `responses` key.
 
 ---
 
@@ -268,8 +398,13 @@ Trace calls `tools/list` on connect, then `tools/call` with the matched tool. Th
         "id": "proxied_user_id",
         "timezone": "Asia/Kolkata",
         "locale": "en-IN",
-        "name": "Ishaan",
-        "location": { ... }
+        "name": "Ishaan",                    // only if user.profile.read granted
+        "location": {                        // only if user.location.read granted
+          "country": "IN",
+          "city": "Delhi",
+          "latitude": 28.6139,
+          "longitude": 77.2090
+        }
       },
       "pending_context": null
     }
@@ -316,7 +451,7 @@ Default is `state: 'completed'`. Use `state: 'error'` to clear the session on fa
 
 ## 7. AWAIT_INPUT — Cross-Dispatch Follow-up
 
-`AWAIT_INPUT` lets a skill ask the user a question and receive the answer in a subsequent `interaction.dialog` event, with the original context preserved. This works across separate dispatch events — e.g., a `media.photo` webhook can ask a follow-up that the user answers via voice.
+`AWAIT_INPUT` lets a skill ask the user a question and receive the answer in a subsequent `instant.message` event, with the original context preserved. This works across separate dispatch events — e.g., a `media.photo` webhook can ask a follow-up that the user answers via voice.
 
 ### When to use it
 - Photo analyzed but food not detected → ask what the user ate
@@ -355,13 +490,13 @@ Return from webhook callback (inside `responses`) or MCP `embedded_responses`:
 
 ### What the skill receives on the follow-up
 
-The user's answer arrives as a normal `interaction.dialog` event. The platform injects `pending_context` at the top level:
+The user's answer arrives as a normal `instant.message` event. The platform injects `pending_context` at the top level:
 
 **Webhook payload:**
 ```json
 {
   "event": {
-    "channel": "interaction.dialog",
+    "channel": "instant.message",
     "source": "phone_voice",
     "query": "I had grilled chicken and rice",
     "items": []
@@ -393,15 +528,15 @@ The user's text is in `event.query` (webhook) or `utterance` (MCP). If the user 
 
 ### Routing note for Hybrid skills
 
-For a **Hybrid** skill, all `interaction.dialog` events (including pending-context follow-ups) are routed to the MCP `handle_dialog` tool. Only **Webhook-only** skills receive pending-context follow-ups at the webhook endpoint.
+For a **Hybrid** skill, all `instant.message` events (including pending-context follow-ups) are routed to the MCP `handle_dialog` tool. Only **Webhook-only** skills receive pending-context follow-ups at the webhook endpoint.
 
 ### Chaining follow-ups
 
 Return another `AWAIT_INPUT` from the follow-up response to ask another question:
 ```
 Turn 1: media.photo → no food → AWAIT_INPUT "What did you eat?"
-Turn 2: interaction.dialog "chicken salad" → log meal → AWAIT_INPUT "Any calorie target for today?"
-Turn 3: interaction.dialog "2000 kcal" → set goal → NOTIFICATION "Goal set: 2,000 kcal"
+Turn 2: instant.message "chicken salad" → log meal → AWAIT_INPUT "Any calorie target for today?"
+Turn 3: instant.message "2000 kcal" → set goal → NOTIFICATION "Goal set: 2,000 kcal"
 ```
 
 ---
@@ -421,10 +556,13 @@ All responses use the same shape whether in a webhook callback or MCP `embedded_
     "title": "Meal Logged",
     "body": "Chicken and rice — 550 kcal",
     "tts": "Five hundred fifty calories logged.",
+    "speak": false,
     "persist": true
   }
 }
 ```
+
+`speak: false` — suppress text-to-speech on the glasses speaker. Use this when the user is in a social setting (a wedding, concert, meeting) where a voice read-out would be disruptive. The notification still appears on the phone and in the activity feed.
 
 ### feed_item
 ```json
@@ -479,6 +617,27 @@ Use the user's own connected accounts without ever seeing a token.
 ```
 
 Available tools: `mail.send` · `calendar.create`
+
+### integration_action
+Perform an action in a third-party service the user has connected (e.g. Google Photos, Notion, Slack).
+Unlike `tool_call`, integration actions are dispatched through the platform's integration layer — the skill never sees tokens.
+```json
+{
+  "type": "integration_action",
+  "content": {
+    "integration": "google_photos",
+    "action": "add_to_album",
+    "params": {
+      "album_name": "Trip 2026",
+      "image_url": "https://..."
+    },
+    "success_message": "Photo added to your Google Photos album.",
+    "error_message": "Couldn't reach Google Photos — check your connection."
+  }
+}
+```
+
+Declare required integrations in the Developer Console under `allowedIntegrations`. The platform injects available integrations into `granted_integrations[]` on every request.
 
 ### await_input
 See §7 above.
@@ -539,12 +698,45 @@ Content-Type: application/json
 Use `node-cron` or a job queue to trigger this on a schedule. Store `user.id` + `callback_url` from the first event dispatch.
 
 ### C. Vision / Multimodal
-When receiving a photo (webhook `media.photo` or MCP phone image):
+
+**Two paths depending on `routing_mode`:**
+
+**Passive (`media.photo` → webhook):** Background processing.
 1. Download from `items[0].url` (presigned, expires in ~15 minutes — process promptly)
 2. Run through a vision LLM (Gemini `gemini-2.0-flash`, GPT-4o)
 3. Extract structured data, store result
+4. Optionally return `await_input` in the callback to ask a follow-up question
 
-`items[0].imageDescription` is a brief GPT-4o description already attached by the platform (useful for routing context, not detailed enough for analysis). Run your own vision call for full analysis.
+**Active (`instant.image` + `routing_mode: active` + MCP/hybrid interface):** Synchronous, spoken response.
+
+Platform calls `handle_dialog` with the image in `items[]`, same as a phone image dialog event:
+
+```json
+{
+  "utterance": "",
+  "userId": "proxied_user_id",
+  "items": [{
+    "id": "item_abc",
+    "url": "https://s3.trace.ai/presigned/...",
+    "mimeType": "image/jpeg",
+    "imageDescription": "A plate with grilled chicken and rice."
+  }],
+  "context": {
+    "source": "instant_image",
+    "hasImage": true,
+    "imageDescription": "A plate with grilled chicken and rice."
+  },
+  "user": { "id": "proxied_user_id", "timezone": "Asia/Kolkata" }
+}
+```
+
+Your skill:
+1. Receives the call synchronously
+2. Runs vision LLM on `items[0].url`
+3. Returns spoken text + optional AWAIT_INPUT in `embedded_responses`
+4. User hears the response immediately; AWAIT_INPUT follow-up arrives via `instant.message`
+
+`items[0].imageDescription` is a brief pre-analysis already attached by the platform (useful for routing context, not detailed enough for analysis). Run your own vision call for full analysis.
 
 ---
 
@@ -563,13 +755,19 @@ When helping a developer build a Trace Skill:
 
 1. **Start with the manifest** — define channels, routing_mode, and domains first.
 2. **Security is non-negotiable** — always include HMAC verification in the first draft.
-3. **Pick the right interface** — background processing → webhook; voice dialog → MCP; both → hybrid.
-4. **Async by default for media** — always `202 → callback` for `media.*` channels.
+3. **Pick the right interface** — silent background processing → webhook + passive; spoken/interactive response → MCP or hybrid + active.
+4. **Async by default for media** — always `202 → callback` for passive `media.*` webhooks. Active `media.photo` on MCP/hybrid is synchronous (no 202 needed).
 5. **Use AWAIT_INPUT instead of state hacks** — if a skill needs clarification before acting, return `await_input`. Don't try to manage conversation state manually.
-6. **Items, not payload** — media URLs are in `event.items[0].url`, not `event.payload.url` or `event.url`.
+6. **Items, not payload** — media URLs are in `event.items[0].url` (webhook) or `toolInput.items[0].url` (MCP). Not in `event.payload.url`.
 7. **Proxy IDs only** — `user.id` is a proxy. Use it as DB key. Never expose or log real user identifiers.
 8. **`context_payload` for follow-ups** — store all state the skill needs in `context_payload` when returning `await_input`. Don't rely on in-memory state across dispatch events.
-9. **Hybrid skills: MCP gets all dialog** — for hybrid skills, all `interaction.dialog` events (including pending-context follow-ups) route to MCP. Check `pending_context` in `toolInput` before running intent classification.
-10. **Handle `items` in MCP** — for phone food photos or any `interaction.dialog` with `hasImage: true`, inspect `toolInput.items` for image URLs and process them with vision.
-11. **`interaction.dialog` trigger required for back-references** — if a skill should respond when users say "save that" or "add that image" after capturing a photo, it **must** declare an `interaction.dialog` trigger (active routing). A `media.photo`-only skill will never receive back-reference dispatches. Use `{ "hasImage": true }` as the filter to match both direct image inputs and back-references in one trigger.
+9. **Hybrid skills: MCP gets all dialog and active media** — for hybrid skills, all `instant.message` events (including pending-context follow-ups) and active `media.*` events route to MCP. Check `pending_context` in `toolInput` before running intent classification.
+10. **Handle `items` in MCP** — for phone images, glasses real-time captures (`instant.image`), and any `instant.message` with `hasImage: true`, inspect `toolInput.items` for image URLs. `instant.image` MCP calls have `context.source = "instant_image"`; `utterance` is `""` for a silent glasses snap, or non-empty if the user spoke alongside the photo (treat it as a note or query about the image).
+11. **`instant.message` trigger required for back-references** — if a skill should respond when users say "save that" or "add that image" after capturing a photo, it **must** declare an `instant.message` trigger (active routing). A `media.photo`-only skill will never receive back-reference dispatches. Use `{ "hasImage": true }` as the filter to match both direct image inputs and back-references in one trigger.
 12. **`phone_image_text` vs `phone_image`** — `phone_image_text` is sent when the user attaches an image AND types a text query in the phone chat. `phone_image` is photo-only with no text. If your skill needs either, filter on `{ "source": ["phone_image", "phone_image_text"] }` or simply `{ "hasImage": true }`.
+13. **`instant.image` + AWAIT_INPUT pattern** — the recommended pattern for glasses real-time photo skills: declare `instant.image` active on a hybrid/mcp skill, process the image in `handle_dialog`, log the result, and return `await_input` asking for context ("Anything to add?"). The user's voice reply arrives as a normal `instant.message` event with `pending_context` injected. Use `media.photo` (passive) for WiFi-sync background logging where no spoken response is needed.
+14. **Human line in `text`** — Put the sentence the user should hear in `content[].type === "text"`. The platform speaks that verbatim on active MCP paths. Do not rely on `feed_item` for TTS. `embedded_responses` are side-effects (feed, await, reminders) with `speak: false`.
+15. **No duplicate feed on enrich** — After a photo/voice capture, `await_input` follow-ups update SQLite only; do not emit another generic `feed_item` ("Moment updated"). The capture card is enough.
+16. **Feed titles** — Short, user-centric titles (note snippet, activity, tags) — not a truncated vision paragraph.
+17. **Reference implementation** — Copy patterns from `skills-server/src/skills/scrapbook/`: hybrid manifest, `pending_context`, `embedded_responses`, SQLite keyed on `user.id`, auto-wrap prior event on `start_event`.
+18. **Location** — Request `user.location.read`. Read `toolInput.user.location` (lat/lng/city). Mobile clients sync profile location via `LocationSyncHandler`; brain also falls back to stored profile coords when the request omits them.
