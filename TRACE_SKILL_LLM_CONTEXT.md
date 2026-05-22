@@ -163,9 +163,11 @@ The manifest is the single source of truth for how Trace routes events to your s
 
 ## 2. Security: HMAC Verification
 
-**Every** request from Trace is signed. You must verify it before processing.
+**Webhook** requests from Trace are signed. You must verify the signature before processing.
 
-Headers sent by Trace:
+> **MCP calls are not signed.** The platform does not send `X-Trace-Signature` on JSON-RPC requests to your `/mcp` endpoint. Only apply HMAC verification on your `/webhook` route.
+
+Headers sent by Trace (webhook only):
 - `X-Trace-Signature: sha256=<hex>`
 - `X-Trace-Timestamp: <unix_ms>`
 
@@ -610,11 +612,25 @@ Use the user's own connected accounts without ever seeing a token.
   "content": {
     "tool": "mail.send",
     "params": { "subject": "Meeting notes", "body": "...", "html": "..." },
-    "on_result": "notify_user",
-    "success_message": "Notes sent to your email."
+    "on_result": "silent",
+    "success_message": "Notes sent to your email.",
+    "error_message": "Couldn't send — check your Gmail connection in Settings.",
+    "speak": false
   }
 }
 ```
+
+**`on_result`** controls what happens after the tool executes:
+
+| Value | Behaviour |
+|---|---|
+| `"silent"` | **(default)** Fire and forget. No success notification. A Pusher event is emitted so the web/app layer can react, but the user hears nothing extra. |
+| `"notify_user"` | Send a push notification on success using `success_message` (or a generic "action completed" if omitted). |
+| `"callback"` | POST the result (HMAC-signed) to your skill's `endpoints.callback` URL. Use when you need to chain logic after the action completes server-side. |
+
+**`error_message`** — always fires as a push notification on failure, regardless of `on_result`. The platform sends this text if the tool call fails or the user hasn't connected their account. Omit to use the platform default ("Could not complete — try again").
+
+**`speak: false`** — suppresses TTS for the success notification. Use this when the MCP `text` content already acknowledged the action out loud — otherwise the user hears two spoken confirmations.
 
 Available tools: `mail.send` · `calendar.create`
 
@@ -740,16 +756,179 @@ Your skill:
 
 ---
 
-## 11. Development Workflow
+## 11. Enrichment Patterns — Linking Media and Context
+
+The richest skills combine passive media capture with contextual enrichment from the user. There are four distinct patterns; most production skills use all of them.
+
+### A. Photo-first → voice follow-up (AWAIT_INPUT)
+
+The simplest enrichment loop: capture and analyze a photo, ask the user for context, receive their answer as a follow-up `instant.message`.
+
+```
+media.photo (passive webhook)
+  → analyze image with vision LLM
+  → insertMoment({ ...analysis, user_note: null })   ← no context yet
+  → callback with AWAIT_INPUT:
+      question: "Who are you with and what's happening?"
+      context_key: "enrich_moment"
+      context_payload: { moment_id, event_id, image_url }
+
+  ↓ user answers by voice
+
+instant.message (active → MCP handle_dialog)
+  → pending_context.context_key === "enrich_moment"
+  → extractEnrichment(utterance)
+  → enrichMoment(moment_id, enrichment)
+  → text: "Got it — [snippet], with [name]."   ← spoken ack only, NO second feed card
+```
+
+**Critical rule:** do not emit a second `feed_item` when enriching. The photo's card was already created at capture time. Return only a spoken `text` ack.
+
+Handle the three user replies your AWAIT_INPUT will receive:
+
+```typescript
+// User wants to skip
+const isSkip = /^(skip|no note|no thanks|log it|ok|yes|sure|fine|sounds good)\b/i.test(utterance);
+if (isSkip) return { content: [{ type: 'text', text: "Got it — moment saved as is." }] };
+
+// User wants to remove the moment entirely
+const isDelete = /^(remove|delete|discard|never mind|forget it|cancel)\b/i.test(utterance);
+if (isDelete) { deleteMoment(moment_id); return { content: [{ type: 'text', text: "Got it — moment removed." }] }; }
+
+// Otherwise — enrich
+const enrichment = await extractEnrichment(utterance);
+enrichMoment(moment_id, enrichment);
+```
+
+---
+
+### B. Voice-first → photo follow-up (proximity linking)
+
+The user narrates a moment ("Heading into the ceremony — so excited") then silently snaps a photo within the next 30–60 seconds. Without proximity linking, the photo arrives with no context and triggers an AWAIT_INPUT the user already answered verbally.
+
+**Strategy:**
+1. When a voice note arrives (MCP): insert a `voice_note` moment with a `captured_at` timestamp and an `is_paired` flag (default false).
+2. When the next photo arrives (webhook or MCP): query for the most recent unpaired voice note within your proximity window.
+3. If found: copy the voice note's `people`, `activity`, `user_note` onto the photo moment; mark the voice note as paired; **skip AWAIT_INPUT entirely**.
+
+```typescript
+// DB helper (SQLite example)
+function getRecentVoiceNote(userId: string, withinSeconds: number) {
+  return db.prepare(`
+    SELECT * FROM moments
+    WHERE user_id = ? AND type = 'voice_note' AND is_paired = 0
+      AND captured_at >= datetime('now', '-' || ? || ' seconds')
+    ORDER BY captured_at DESC LIMIT 1
+  `).get(userId, withinSeconds);
+}
+
+// In photo handler
+const linkedNote = getRecentVoiceNote(userId, 45);
+if (linkedNote) {
+  insertMoment({ ...photoFields, people: linkedNote.people, user_note: linkedNote.user_note });
+  markVoiceNotePaired(linkedNote.moment_id, photoMomentId);
+  // speak: "Got it — photo linked to '[note snippet]'."  No AWAIT_INPUT.
+}
+```
+
+This applies in **both** the webhook (`media.photo` passive) and MCP (`instant.image` active) handlers — always check for a linked note before deciding whether to ask a follow-up.
+
+---
+
+### C. Late enrichment (user adds context minutes later)
+
+A common pattern: the user snaps a photo silently, continues the experience, then says "that was Priya's speech" or "at the Taj Mahal" 2–10 minutes later. Without late enrichment, this gets classified as a new voice note.
+
+**Detection — two layers:**
+
+**Layer 1: fast regex** (run before LLM classification):
+```typescript
+function looksLikeLateEnrichment(utterance: string): boolean {
+  if (utterance.trim().length > 140) return false; // long text = new beat
+  return /^(that was|it was|those were|that's|this was|we were|they were|with my|at the|in the)\b/i.test(utterance.trim());
+}
+```
+
+**Layer 2: LLM intent** — include `"late_enrichment"` as a possible intent in your classification prompt, returning the enrichment context in a structured field. Use this as a fallback when the regex doesn't catch it.
+
+**On match:** query for the most recent unenriched photo within your window (e.g. 10 minutes), apply enrichment, ack with a spoken line — no new feed card.
+
+```typescript
+const recent = getRecentUnenrichedPhoto(userId, 600); // 10-min window in seconds
+if (recent) {
+  const enrichment = await extractEnrichment(utterance);
+  enrichMoment(recent.moment_id, enrichment);
+  return { content: [{ type: 'text', text: `Got it — ${snippet}.` }] };
+}
+// No recent photo → fall through to voice_note intent
+```
+
+---
+
+### D. Image as follow-up to a voice note (`allow_image: true`)
+
+When you log a voice note and want to let the user attach a photo:
+
+```json
+{
+  "type": "await_input",
+  "content": {
+    "question": "Snap a photo to go with it, or say \"skip\" when you're done.",
+    "context_key": "enrich_moment",
+    "context_payload": { "moment_id": "...", "event_id": "..." },
+    "allow_image": true
+  }
+}
+```
+
+On the follow-up dispatch, check `items` first — the user may have responded with a photo, text, or both:
+
+```typescript
+// MCP pending_context handler
+const imageItems = toolInput.items?.filter(item => item.mimeType?.startsWith('image/')) ?? [];
+
+if (imageItems.length > 0) {
+  // User sent a photo as their follow-up
+  const analysis = await analyzePhoto(imageItems[0].url);
+  insertPhotoMoment({ ...analysis, linkedVoiceNoteId: context_payload.moment_id });
+  return { content: [{ type: 'text', text: "Got it — photo saved with your note." }] };
+}
+
+if (utterance.trim() && !isSkip(utterance)) {
+  // User added more text context
+  enrichMoment(context_payload.moment_id, await extractEnrichment(utterance));
+  return { content: [{ type: 'text', text: "Got it — note updated." }] };
+}
+```
+
+---
+
+### E. Spoken ack formula
+
+Keep enrichment acknowledgements short and natural for TTS:
+
+```
+"Got it — [note snippet][, with [name(s)]][, at [location]]."
+```
+
+Rules:
+- Strip trailing punctuation from the snippet before embedding it
+- Max ~90 chars before truncation with `…`
+- Omit the relationship noun if `people` contains only relationship terms ("wife", "mom") — they read awkwardly as "with wife"
+- Never say "logged" or "saved" twice in one turn if the primary `text` content already said it
+
+---
+
+## 12. Development Workflow
 
 1. **Local testing:** expose with `ngrok`. Set the ngrok URL in the Developer Console.
 2. **Deployment:** Railway, Render, or any VPS. Ensure the endpoint is publicly accessible.
 3. **Validate payloads:** log `req.body` on first run to understand the exact shape for your channel.
-4. **HMAC in dev:** temporarily log the expected vs received signature if verification fails — check that you're using `rawBody`, not the parsed JSON.
+4. **HMAC in dev:** temporarily log the expected vs received signature if verification fails — check that you're using `rawBody`, not the parsed JSON. Remember: HMAC verification applies to `/webhook` only — do not add it to `/mcp`.
 
 ---
 
-## 12. LLM Counselor Guidelines
+## 13. LLM Counselor Guidelines
 
 When helping a developer build a Trace Skill:
 
@@ -769,5 +948,5 @@ When helping a developer build a Trace Skill:
 14. **Human line in `text`** — Put the sentence the user should hear in `content[].type === "text"`. The platform speaks that verbatim on active MCP paths. Do not rely on `feed_item` for TTS. `embedded_responses` are side-effects (feed, await, reminders) with `speak: false`.
 15. **No duplicate feed on enrich** — After a photo/voice capture, `await_input` follow-ups update SQLite only; do not emit another generic `feed_item` ("Moment updated"). The capture card is enough.
 16. **Feed titles** — Short, user-centric titles (note snippet, activity, tags) — not a truncated vision paragraph.
-17. **Reference implementation** — Copy patterns from `skills-server/src/skills/scrapbook/`: hybrid manifest, `pending_context`, `embedded_responses`, SQLite keyed on `user.id`, auto-wrap prior event on `start_event`.
+17. **Reference implementation** — Copy patterns from `skills-server/src/skills/scrapbook/`: hybrid manifest, `pending_context`, `embedded_responses`, SQLite keyed on `user.id`, auto-wrap prior event on `start_event`. See §11 for enrichment patterns (photo-first, voice-first, late enrichment, image follow-up).
 18. **Location** — Request `user.location.read`. Read `toolInput.user.location` (lat/lng/city). Mobile clients sync profile location via `LocationSyncHandler`; brain also falls back to stored profile coords when the request omits them.
