@@ -35,9 +35,18 @@ Rules:
 - Map natural language to the lookup keys above (e.g. "in editing" → status = 'editing';
   "in review" may mean script_in_review/editing_in_review/thumbnail_in_review — prefer the
   closest, or use status LIKE '%in_review' if the user is generic).
-- "latest tweet summary" → SELECT from x_tweet_summaries ORDER BY summary_date DESC LIMIT 1.
+- Resolve relative dates IN SQL — never ask the user for a date you can compute:
+  "today" → CURRENT_DATE, "yesterday" → CURRENT_DATE - INTERVAL '1 day',
+  "this week" → >= date_trunc('week', CURRENT_DATE), "last 7 days" → >= CURRENT_DATE - INTERVAL '7 days'.
+- Tweet summaries: "latest tweet summary" → x_tweet_summaries ORDER BY summary_date DESC LIMIT 1;
+  "tweet summary for yesterday/<date>" → filter summary_date = that date (fall back to the latest
+  if you're unsure). There is one summary per date — ignore subjective adjectives like
+  "interesting/innovative/important/best": just return that day's summary_text.
+- "top/best/most interesting tweets" → ORDER BY (like_count + retweet_count + reply_count) DESC.
 - Prefer human-readable columns (title, name, summary_text, label) over ids/uuids.
-- If the question is ambiguous or needs info not in the schema, return {"clarify": "..."}.`;
+- STRONGLY prefer answering. Return {"clarify": "..."} only as a last resort when the question
+  cannot be mapped to ANY reasonable query at all. Do NOT ask about subjective qualifiers or about
+  dates/criteria you can reasonably assume — make a sensible default choice and answer.`;
 }
 
 /** Generate a read-only SELECT (or a clarification) for the question. */
@@ -70,10 +79,14 @@ export async function summarizeAnswer(question: string, rows: any[]): Promise<st
       {
         role: 'system',
         content:
-          'You are a concise voice assistant for the user\'s content pipeline. ' +
-          'Given the question and the JSON result rows, answer in ONE short, natural ' +
-          'spoken sentence (two at most). No markdown, no lists, no SQL. Use plain ' +
-          'numbers and names. If there are no rows, say nothing matched in a friendly way.',
+          "You are a helpful voice assistant for the user's content pipeline. Given the " +
+          'question and the JSON result rows, answer in natural spoken prose, up to about ' +
+          '100 words. Be informative and specific — include the relevant names, titles, ' +
+          'counts, dates and summary detail the rows contain. Match length to the content: ' +
+          'a simple count or status can be one sentence, while a summary or a list of items ' +
+          'deserves a fuller answer (still under ~100 words). Keep it conversational for ' +
+          'text-to-speech: no markdown, no bullet points, no tables, no SQL. If there are ' +
+          'no rows, say nothing matched in a friendly way.',
       },
       {
         role: 'user',
