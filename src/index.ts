@@ -109,24 +109,10 @@ function speak(text: string) {
   return { content: [{ type: 'text', text }] };
 }
 
-// Final answer: the spoken `text` line PLUS a visible toast/feed card on the
-// phone. The notification's `speak: false` avoids a double read-out, since the
-// `text` content is already spoken. Flip to `speak: true` (and you can pass a
-// separate `tts` string) if you want the notification itself to do the TTS.
+// Final answer: just the spoken `text` line, read out via TTS on the glasses.
 function answer(text: string) {
   return {
-    content: [
-      { type: 'text', text },
-      {
-        type: 'embedded_responses',
-        responses: [
-          {
-            type: 'notification',
-            content: { title: 'Content Gap', body: text, speak: false, persist: true },
-          },
-        ],
-      },
-    ],
+    content: [{ type: 'text', text }],
   };
 }
 
