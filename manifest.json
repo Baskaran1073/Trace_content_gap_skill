@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "interface": "mcp",
   "endpoints": {
-    "mcp": "https://your-domain.localhost.run/mcp"
+    "mcp": "https://tracecontentgapskill-production.up.railway.app/mcp"
   },
   "triggers": [
     { "channel": "instant.message", "routing_mode": "active" }
@@ -21,7 +21,7 @@
   "isPrivate": true,
   "dataRetention": {
     "max_days": 1,
-    "deletion_webhook": "https://your-domain.localhost.run/delete-user"
+    "deletion_webhook": "https://tracecontentgapskill-production.up.railway.app/delete-user"
   },
   "categories": ["productivity"]
 }
