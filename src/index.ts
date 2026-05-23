@@ -1,9 +1,11 @@
+import './env'; // must be first — loads .env before modules that read it
 import express, { Request, Response } from 'express';
-import dotenv from 'dotenv';
 import crypto from 'crypto';
 import { verifyTraceSignature } from './hmac';
-
-dotenv.config();
+import { getSchemaText } from './schema';
+import { runReadOnlyQuery } from './db';
+import { generateSql, summarizeAnswer } from './agents';
+import { getOwnerUserId } from './config';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -71,7 +73,10 @@ app.post('/mcp', async (req: Request, res: Response) => {
         tools: [
           {
             name: 'handle_dialog',
-            description: 'My main dialog tool.',
+            description:
+              "Answer the user's spoken questions about their Content Gap content pipeline " +
+              '(items in editing/draft/published, statuses, counts) and X/tweets (latest ' +
+              'summaries, top tweets). Read-only.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -87,26 +92,79 @@ app.post('/mcp', async (req: Request, res: Response) => {
   if (method === 'tools/call') {
     const { name, arguments: args } = params;
     if (name === 'handle_dialog') {
-      return res.json({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          content: [
-            { type: 'text', text: `You said: ${args.utterance}` },
-            {
-              type: 'embedded_responses',
-              responses: [
-                { type: 'feed_item', content: { title: 'Dialog Handled', story: args.utterance } }
-              ]
-            }
-          ]
-        }
-      });
+      const result = await handleContentGapDialog(args || {});
+      return res.json({ jsonrpc: '2.0', id, result });
     }
   }
 
   res.status(404).json({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
 });
+
+// ─── Content Gap dialog pipeline ──────────────────────────────────────────────
+// utterance → GPT-4o text-to-SQL → read-only query → GPT-4o spoken summary.
+
+// Plain spoken line — used for prompts/errors. On voice turns the platform
+// speaks the `text` content via TTS.
+function speak(text: string) {
+  return { content: [{ type: 'text', text }] };
+}
+
+// Final answer: the spoken `text` line PLUS a visible toast/feed card on the
+// phone. The notification's `speak: false` avoids a double read-out, since the
+// `text` content is already spoken. Flip to `speak: true` (and you can pass a
+// separate `tts` string) if you want the notification itself to do the TTS.
+function answer(text: string) {
+  return {
+    content: [
+      { type: 'text', text },
+      {
+        type: 'embedded_responses',
+        responses: [
+          {
+            type: 'notification',
+            content: { title: 'Content Gap', body: text, speak: false, persist: true },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+async function handleContentGapDialog(args: any) {
+  const utterance: string = (args.utterance || args.context?.query || '').trim();
+  const userId: string | undefined = args.userId || args.user?.id;
+  console.log(`[handle_dialog] user=${userId ?? 'unknown'} utterance="${utterance}"`);
+
+  // Private skill: only the owner may query (allow when no userId, e.g. local curl).
+  const owner = getOwnerUserId();
+  if (owner && userId && userId !== owner) {
+    return speak('Sorry, this skill is private.');
+  }
+
+  if (!utterance) {
+    return speak('What would you like to know about your content?');
+  }
+
+  try {
+    const schema = await getSchemaText();
+    const plan = await generateSql(utterance, schema);
+
+    if (plan.clarify) {
+      // Keep the voice session open so the user's reply comes back to us.
+      return { content: [{ type: 'text', text: plan.clarify }], state: 'awaiting_input' };
+    }
+    if (!plan.sql) {
+      return speak("I couldn't turn that into a query — try rephrasing?");
+    }
+
+    const rows = await runReadOnlyQuery(plan.sql);
+    const replyText = await summarizeAnswer(utterance, rows);
+    return answer(replyText);
+  } catch (err: any) {
+    console.error('[handle_dialog] error:', err?.message);
+    return speak('Sorry, I ran into a problem answering that.');
+  }
+}
 
 // ─── Callback helper ─────────────────────────────────────────────────────────
 // Sign and POST the skill's response back to the platform after async processing.

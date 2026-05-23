@@ -1,29 +1,27 @@
 {
-  "name": "Template Skill",
+  "name": "Content Gap Voice",
+  "description": "Ask questions about your Content Gap pipeline and tweets by voice and hear the answer. Read-only.",
   "version": "1.0.0",
-  "interface": "hybrid",
+  "interface": "mcp",
   "endpoints": {
-    "webhook": "https://your-domain.ngrok-free.app/webhook",
-    "mcp": "https://your-domain.ngrok-free.app/mcp"
+    "mcp": "https://your-domain.localhost.run/mcp"
   },
   "triggers": [
-    { "channel": "instant.message", "routing_mode": "active" },
-    { "channel": "instant.image",      "routing_mode": "active" },
-    { "channel": "media.photo",        "routing_mode": "passive" }
+    { "channel": "instant.message", "routing_mode": "active" }
   ],
   "domains": {
-    "general": "Handle general greetings and tests for the template skill. Match utterances like 'test template' or 'hello from template'."
+    "content_gap": "Answer questions about the user's Content Gap content pipeline and X/Twitter data: what content is in editing/script/shooting/thumbnail/review/ready/published, statuses and counts of content items, scripts, assets and final videos, content priorities and platforms, plus the latest tweet summary, recent or top tweets, and followed accounts. Match utterances like 'what's in editing', 'how many drafts do I have', 'what's the latest tweet summary', 'what content is ready to publish', 'how many videos are published this month'."
+  },
+  "execution": {
+    "mode": "sync"
   },
   "permissions": [
-    "notification.send",
-    "user.profile.read",
-    "user.location.read"
+    "user.profile.read"
   ],
-  "allowedTools": [
-    "mail.send"
-  ],
-  "data_retention": {
-    "max_days": 30,
-    "deletion_webhook": "https://your-domain.ngrok-free.app/delete-user"
-  }
+  "isPrivate": true,
+  "dataRetention": {
+    "max_days": 1,
+    "deletion_webhook": "https://your-domain.localhost.run/delete-user"
+  },
+  "categories": ["productivity"]
 }
